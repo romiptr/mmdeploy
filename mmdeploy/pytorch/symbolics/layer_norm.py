@@ -2,17 +2,15 @@
 # Modified from:
 # https://github.com/pytorch/pytorch/blob/9ade03959392e5a90b74261012de1d806cab2253/torch/onnx/symbolic_opset9.py
 
+import torch
 from torch.onnx.symbolic_helper import parse_args
 
 from mmdeploy.core import SYMBOLIC_REWRITER
-from mmdeploy.utils import Backend
+from mmdeploy.utils import Backend, get_backend
 
 
-@SYMBOLIC_REWRITER.register_symbolic(
-    'layer_norm',
-    is_pytorch=True,
-    arg_descriptors=['v', 'is', 'v', 'v', 'f', 'i'])
-def layer_norm__default(g, input, normalized_shape, weight, bias, eps,
+@parse_args('v', 'is', 'v', 'v', 'f', 'i')
+def layer_norm_decompose(g, input, normalized_shape, weight, bias, eps,
                         cudnn_enable):
     """Symbolic function for `layer_norm`
 
@@ -46,7 +44,7 @@ def layer_norm__default(g, input, normalized_shape, weight, bias, eps,
 
 
 @parse_args('v', 'is', 'v', 'v', 'f', 'i')
-def _layer_norm_ncnn(g, input, normalized_shape, weight, bias, eps,
+def layer_norm_ncnn(g, input, normalized_shape, weight, bias, eps,
                      cudnn_enable):
     """Symbolic function for `layer_norm`.
 
@@ -60,11 +58,58 @@ def _layer_norm_ncnn(g, input, normalized_shape, weight, bias, eps,
         'mmdeploy::LayerNorm', input, weight, bias, affine_i=1, epsilon_f=eps)
 
 
-@SYMBOLIC_REWRITER.register_symbolic(
-    'layer_norm', is_pytorch=True, backend=Backend.NCNN.value)
-def layer_norm__ncnn(*args):
+# modified from: 
+# https://github.com/pytorch/pytorch/blob/a84391f1ae7ac5d077844cd09c8de2238320e01b/torch/onnx/_internal/torchscript_exporter/symbolic_opset17.py
+@parse_args('v', 'is', 'v', 'v', 'f', 'i')
+def layer_norm_tensorrt(g, input, normalized_shape, weight, bias, eps,
+                        cudnn_enable):
+    """Symbolic function for `layer_norm`.
+
+    PyTorch does not support export layer_norm to ONNX by default. We add the
+    support here. `layer_norm` will be exported as ONNX node
+    'mmdeploy::layer_norm'
+
+    Tested in pytorch 2.1.0
+    Layer normalization is supported from onnx >= 17, 
+    this is for onnx version below that.
+    """
+    # normalized_shape: input shape from an expected input of size
+    # axis: The first normalization dimension.
+    # layer_norm normalizes on the last D dimensions,
+    # where D is the size of normalized_shape
+    axis = -len(normalized_shape)
+    if weight is None or weight.node().mustBeNone():
+        weight_value = torch.tensor(
+            [1.]).type('torch.' + input.type().scalarType() + 'Tensor')
+        weight = g.op('Constant', value_t=weight_value)
+    if bias is None or bias.node().mustBeNone():
+        bias_value = torch.tensor(
+            [0.]).type('torch.' + input.type().scalarType() + 'Tensor')
+        bias = g.op('Constant', value_t=bias_value)
+    return g.op(
+        "mmdeploy::TRTLayerNormalization",
+        input,
+        weight,
+        bias,
+        epsilon_f=eps,
+        axis_i=axis,
+    )
+
+
+@SYMBOLIC_REWRITER.register_symbolic('layer_norm', is_pytorch=True)
+def layer_norm__default(*args):
     """Register default symbolic function for `layer_norm`.
 
     Add support to layer_norm to ONNX.
     """
-    return _layer_norm_ncnn(*args)
+    from packaging import version
+
+    ctx = SYMBOLIC_REWRITER.get_context()
+    torch_version = version.parse(torch.__version__)
+    backend = get_backend(ctx.cfg)
+    if backend == Backend.NCNN:
+        return layer_norm_ncnn(*args)
+    elif backend == Backend.TENSORRT and torch_version >= version.parse("1.19.0"): 
+        return layer_norm_tensorrt(*args)
+    else:
+        return layer_norm_decompose(*args)
